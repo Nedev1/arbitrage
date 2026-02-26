@@ -45,7 +45,6 @@ public sealed class ArbitrageEngine
     private double _maxSpread = 2.0;
     private double _triggerThreshold = 0.5;
     private double _hardStopLoss = 5.0;
-    private double _trailingTp = 1.0;
     private string _sourceTerminal = string.Empty;
     private string _targetTerminal = string.Empty;
     private string _masterSymbol = string.Empty;
@@ -236,7 +235,6 @@ public sealed class ArbitrageEngine
             _maxSpread = config.MaxSpread;
             _triggerThreshold = config.TriggerThreshold;
             _hardStopLoss = config.HardStopLoss;
-            _trailingTp = config.TrailingTp;
             _sourceTerminal = (config.SourceTerminal ?? string.Empty).Trim();
             _targetTerminal = (config.TargetTerminal ?? string.Empty).Trim();
             _masterSymbol = (config.MasterSymbol ?? string.Empty).Trim();
@@ -955,6 +953,31 @@ public sealed class ArbitrageEngine
         {
             while (fills.TryRead(out var fill))
             {
+                var isOrderError = string.Equals(fill.Side, "OrderFailed", StringComparison.OrdinalIgnoreCase);
+                if (isOrderError)
+                {
+                    if (_isAwaitingFill)
+                    {
+                        var expectedTerminal = _activeTargetTerminal;
+                        var expectedSymbol = _activeSlaveSymbol;
+                        var fillTerminal = fill.TerminalId ?? string.Empty;
+                        var isExpectedTerminal = expectedTerminal.Length == 0
+                                                 || string.Equals(fillTerminal, expectedTerminal, StringComparison.OrdinalIgnoreCase);
+                        var isExpectedSymbol = expectedSymbol.Length == 0 || SymbolMatches(fill.Symbol, expectedSymbol);
+
+                        if (isExpectedTerminal && isExpectedSymbol)
+                        {
+                            Log?.Invoke(string.Concat(
+                                "[EXECUTION ERROR] Broker rejected order. Code: ",
+                                fill.Ticket.ToString(CultureInfo.InvariantCulture)));
+                            ResetOpenPositionState();
+                        }
+                    }
+
+                    FillReceived?.Invoke(fill);
+                    continue;
+                }
+
                 if (_hasOpenPosition && _requestTimeMs > 0)
                 {
                     var expectedTerminal = _activeTargetTerminal;
@@ -1211,7 +1234,6 @@ public sealed class EngineConfig
     public double MaxSpread { get; set; }
     public double TriggerThreshold { get; set; }
     public double HardStopLoss { get; set; }
-    public double TrailingTp { get; set; }
     public bool UseRithmic { get; set; }
     public string? RithmicUsername { get; set; }
     public string? RithmicPassword { get; set; }
