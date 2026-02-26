@@ -21,7 +21,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private string _maxSpread = "2.0";
     private string _triggerThreshold = "0.5";
     private string _hardStopLoss = "5.0";
-    private string _trailingTp = "1.0";
     private bool _useRithmic;
     private string _rithmicUsername = string.Empty;
     private string _rithmicPassword = string.Empty;
@@ -50,7 +49,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public string MaxSpread { get => _maxSpread; set { _maxSpread = value; OnPropertyChanged(); } }
     public string TriggerThreshold { get => _triggerThreshold; set { _triggerThreshold = value; OnPropertyChanged(); } }
     public string HardStopLoss { get => _hardStopLoss; set { _hardStopLoss = value; OnPropertyChanged(); } }
-    public string TrailingTp { get => _trailingTp; set { _trailingTp = value; OnPropertyChanged(); } }
     public bool UseRithmic
     {
         get => _useRithmic;
@@ -99,7 +97,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
             MaxSpread = ParseDouble(MaxSpread, 2.0),
             TriggerThreshold = ParseDouble(TriggerThreshold, 0.5),
             HardStopLoss = ParseDouble(HardStopLoss, 5.0),
-            TrailingTp = ParseDouble(TrailingTp, 1.0),
             UseRithmic = UseRithmic,
             RithmicUsername = string.IsNullOrWhiteSpace(RithmicUsername) ? null : RithmicUsername.Trim(),
             RithmicPassword = string.IsNullOrWhiteSpace(RithmicPassword) ? null : RithmicPassword,
