@@ -322,6 +322,44 @@ public sealed class PipeServer : IDisposable
                         continue;
                     }
 
+                    if (message.StartsWith("ERROR|", StringComparison.Ordinal))
+                    {
+                        if (TryParseRawError(message.AsSpan(), out var rawError))
+                        {
+                            var effectiveId = rawError.TerminalId.Trim();
+                            if (effectiveId.Length == 0)
+                            {
+                                effectiveId = _terminalId;
+                            }
+
+                            if (effectiveId.Length == 0)
+                            {
+                                continue;
+                            }
+
+                            if (_terminalId.Length == 0)
+                            {
+                                Identify(effectiveId);
+                            }
+
+                            var errorAsFill = new FilledMessage(
+                                effectiveId,
+                                rawError.Symbol,
+                                rawError.Reason,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                rawError.ErrorCode);
+
+                            _filledWriter.TryWrite(errorAsFill);
+                            _log(
+                                $"ERROR: terminal={effectiveId} symbol={rawError.Symbol} reason={rawError.Reason} code={rawError.ErrorCode}");
+                        }
+
+                        continue;
+                    }
+
                     if (message.StartsWith("CLOSED|", StringComparison.Ordinal))
                     {
                         var id = message.Length > 7 ? message.Substring(7).Trim() : string.Empty;
@@ -498,6 +536,28 @@ public sealed class PipeServer : IDisposable
         return true;
     }
 
+    private static bool TryParseRawError(ReadOnlySpan<char> span, out RawError raw)
+    {
+        raw = default;
+        if (!TryReadToken(ref span, out var kind, requireDelimiter: true)) return false;
+        if (!kind.Equals("ERROR".AsSpan(), StringComparison.Ordinal)) return false;
+
+        if (!TryReadToken(ref span, out var terminalId, requireDelimiter: true)) return false;
+        if (!TryReadToken(ref span, out var symbol, requireDelimiter: true)) return false;
+        if (!TryReadToken(ref span, out var reason, requireDelimiter: true)) return false;
+        if (!TryReadToken(ref span, out var codeToken, requireDelimiter: false)) return false;
+
+        if (!TryParseProtocolLong(codeToken, out var code)) return false;
+
+        raw = new RawError(
+            SpanToTrimmedString(terminalId),
+            SpanToTrimmedString(symbol),
+            SpanToTrimmedString(reason),
+            code);
+
+        return true;
+    }
+
     private static bool TryParseRawFill(ReadOnlySpan<char> span, out RawFill raw)
     {
         raw = default;
@@ -575,6 +635,22 @@ public sealed class PipeServer : IDisposable
             Sl = sl;
             Tp = tp;
             Ticket = ticket;
+        }
+    }
+
+    private readonly struct RawError
+    {
+        public readonly string TerminalId;
+        public readonly string Symbol;
+        public readonly string Reason;
+        public readonly long ErrorCode;
+
+        public RawError(string terminalId, string symbol, string reason, long errorCode)
+        {
+            TerminalId = terminalId;
+            Symbol = symbol;
+            Reason = reason;
+            ErrorCode = errorCode;
         }
     }
 
