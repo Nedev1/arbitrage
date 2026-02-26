@@ -13,6 +13,9 @@ public sealed class ArbitrageEngine
 {
     private const long _maxExecutionLatencyMs = 150;
     private const long _maxEntryAckWaitMs = 20000;
+    private const long _fillResponseTimeoutMs = 2000;
+    private const long _masterFeedStaleMs = 1500;
+    private const long _masterStaleWarningIntervalMs = 2000;
     private const int _unstableTickLimit = 250;
     private const string _analysisSourceTerminalId = "RITHMIC-FAST";
     private const string _cmdKillAll = "KILL|ALL";
@@ -59,6 +62,7 @@ public sealed class ArbitrageEngine
     private double _entryStopDistance;
     private double _targetTpPrice;
     private double _targetSlPrice;
+    private volatile bool _isAwaitingFill;
     private long _openTicket;
     private long _lastFlatTimeMs;
     private long _rejectSpreadCount;
@@ -73,6 +77,8 @@ public sealed class ArbitrageEngine
     private double _srcBid;
     private double _srcAsk;
     private long _srcTs;
+    private long _lastMasterTickMs;
+    private long _lastMasterStaleWarningMs;
     private double _tgtBid;
     private double _tgtAsk;
     private long _tgtTs;
@@ -187,6 +193,9 @@ public sealed class ArbitrageEngine
         _sourceTicksSeen = 0;
         _targetTicksSeen = 0;
         _lastFlatTimeMs = (long)(Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency);
+        _lastMasterTickMs = 0;
+        _lastMasterStaleWarningMs = 0;
+        _isAwaitingFill = false;
         _slippageAbsEwma = 0.0;
         _latencyMsEwma = 0.0;
         _execQualitySamples = 0;
@@ -240,6 +249,9 @@ public sealed class ArbitrageEngine
             _hasSrc = false;
             _hasTgt = false;
             _unstableTickCount = 0;
+            _lastMasterTickMs = 0;
+            _lastMasterStaleWarningMs = 0;
+            _isAwaitingFill = false;
             ResetEntryPersistence();
             IsEngineCalibrating = false;
         }
@@ -548,6 +560,8 @@ public sealed class ArbitrageEngine
         {
             try
             {
+                CheckAwaitingFillTimeout();
+
                 if (_isAnalyzing)
                 {
                     Thread.Sleep(0);
@@ -594,6 +608,32 @@ public sealed class ArbitrageEngine
         _lastSecondTimestamp = nowMs;
     }
 
+    private void CheckAwaitingFillTimeout()
+    {
+        if (!_isAwaitingFill)
+        {
+            return;
+        }
+
+        var lastOrderSentMs = _lastOrderSentTimeMs;
+        if (lastOrderSentMs <= 0)
+        {
+            _isAwaitingFill = false;
+            return;
+        }
+
+        var nowMs = (long)(Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency);
+        var elapsedMs = nowMs - lastOrderSentMs;
+        if (elapsedMs <= _fillResponseTimeoutMs)
+        {
+            return;
+        }
+
+        _isAwaitingFill = false;
+        ResetOpenPositionState();
+        Log?.Invoke("[TIMEOUT] Fill response lost. Resetting state.");
+    }
+
     private void ProcessTick(TickData tick, Stopwatch sw)
     {
         string targetTerminal;
@@ -618,6 +658,7 @@ public sealed class ArbitrageEngine
             return;
         }
 
+        var nowMs = (long)(Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency);
         var isSource = tick.TerminalHash == _sourceTerminalHash && tick.SymbolHash == _masterSymbolHash;
         var isTarget = tick.TerminalHash == _targetTerminalHash && tick.SymbolHash == _slaveSymbolHash;
 
@@ -636,6 +677,8 @@ public sealed class ArbitrageEngine
             _srcBid = tick.Bid;
             _srcAsk = tick.Ask;
             _srcTs = tick.Timestamp;
+            _lastMasterTickMs = nowMs;
+            _lastMasterStaleWarningMs = 0;
             _hasSrc = true;
             if (_isAnalyzing)
             {
@@ -663,10 +706,28 @@ public sealed class ArbitrageEngine
             return;
         }
 
+        if (!isSource && _lastMasterTickMs > 0)
+        {
+            var masterAgeMs = nowMs - _lastMasterTickMs;
+            if (masterAgeMs > _masterFeedStaleMs)
+            {
+                if (nowMs - _lastMasterStaleWarningMs >= _masterStaleWarningIntervalMs)
+                {
+                    _lastMasterStaleWarningMs = nowMs;
+                    Log?.Invoke(string.Concat(
+                        "[WARN] Master feed stale (age=",
+                        masterAgeMs.ToString(CultureInfo.InvariantCulture),
+                        "ms). Entry evaluation paused."));
+                }
+
+                IsEngineCalibrating = false;
+                return;
+            }
+        }
+
         var sourceMid = (_srcBid + _srcAsk) * 0.5;
         var targetMid = (_tgtBid + _tgtAsk) * 0.5;
         var instantaneousOffset = targetMid - sourceMid;
-        var nowMs = (long)(Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency);
         var targetSpread = _tgtAsk - _tgtBid;
         if (targetSpread < 0)
         {
@@ -793,6 +854,7 @@ public sealed class ArbitrageEngine
             var orderSentUtcMs = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _requestTimeMs = orderSentMonoMs;
             _lastOrderSentTimeMs = orderSentMonoMs;
+            _isAwaitingFill = true;
             _requestPrice = _tgtAsk;
             _entryGapDistance = edgeBuy;
             _entryStopDistance = hardStopLoss > 0.0 ? hardStopLoss : 0.0;
@@ -824,6 +886,7 @@ public sealed class ArbitrageEngine
         var sellOrderSentUtcMs = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         _requestTimeMs = sellOrderSentMonoMs;
         _lastOrderSentTimeMs = sellOrderSentMonoMs;
+        _isAwaitingFill = true;
         _requestPrice = _tgtBid;
         _entryGapDistance = edgeSell;
         _entryStopDistance = hardStopLoss > 0.0 ? hardStopLoss : 0.0;
@@ -903,6 +966,7 @@ public sealed class ArbitrageEngine
 
                     if (isExpectedTerminal && isExpectedSymbol)
                     {
+                        _isAwaitingFill = false;
                         var fillReceivedMs = (long)(System.Diagnostics.Stopwatch.GetTimestamp() * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
                         var latencyOriginMs = _lastOrderSentTimeMs > 0 ? _lastOrderSentTimeMs : _requestTimeMs;
                         var executionLatency = fillReceivedMs - latencyOriginMs;
@@ -1018,6 +1082,7 @@ public sealed class ArbitrageEngine
 
                         _requestTimeMs = 0;
                         _lastOrderSentTimeMs = 0;
+                        _isAwaitingFill = false;
                     }
                 }
 
@@ -1077,6 +1142,7 @@ public sealed class ArbitrageEngine
     private void ResetOpenPositionState()
     {
         _hasOpenPosition = false;
+        _isAwaitingFill = false;
         _positionOpenTimeMs = 0;
         _openPrice = 0.0;
         _openSide = 0;
