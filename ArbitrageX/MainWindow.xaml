@@ -113,8 +113,6 @@
           <TextBox Text="{Binding TriggerThreshold}" />
           <TextBlock Text="Hard Stop Loss (USD)" Foreground="#8A93A6" Margin="0,8,0,0" />
           <TextBox Text="{Binding HardStopLoss}" />
-          <TextBlock Text="Trailing TP" Foreground="#8A93A6" Margin="0,8,0,0" />
-          <TextBox Text="{Binding TrailingTp}" />
         </StackPanel>
       </Border>
 
