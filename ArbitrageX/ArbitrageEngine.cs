@@ -11,16 +11,14 @@ namespace ArbitrageX;
 
 public sealed class ArbitrageEngine
 {
-    private const long _maxExecutionLatencyMs = 100;
+    private const long _maxExecutionLatencyMs = 150;
     private const long _maxEntryAckWaitMs = 20000;
-    private const int _minPersistTicks = 2;
-    private const long _minPersistMs = 12;
-    private const long _reentryCooldownMs = 3500;
-    private const double _dynamicExitThreshold = 0.0;
-    private const long _minHoldAfterFillMs = 600;
     private const int _unstableTickLimit = 250;
-    private const bool _enableDynamicExitKill = false;
     private const string _analysisSourceTerminalId = "RITHMIC-FAST";
+    private const string _cmdKillAll = "KILL|ALL";
+    private const string _cmdTradePrefix = "TRADE|";
+    private const string _cmdModifyPrefix = "MODIFY|";
+    private const string _cmdKillPrefix = "KILL|";
 
     [System.Runtime.InteropServices.DllImport("kernel32.dll")]
     private static extern IntPtr GetCurrentThread();
@@ -63,15 +61,10 @@ public sealed class ArbitrageEngine
     private double _targetSlPrice;
     private long _openTicket;
     private long _lastFlatTimeMs;
-    private long _rejectStaleCount;
-    private long _rejectSkewCount;
     private long _rejectSpreadCount;
-    private long _rejectCooldownCount;
-    private long _rejectPersistenceCount;
     private long _rejectThresholdCount;
     private string _activeTargetTerminal = string.Empty;
     private string _activeSlaveSymbol = string.Empty;
-    private long _lastRithmicLogTimeMs;
     private int _sourceTerminalHash;
     private int _targetTerminalHash;
     private int _masterSymbolHash;
@@ -90,10 +83,6 @@ public sealed class ArbitrageEngine
     private long _lastSecondTimestamp;
     private long _sourceTicksSeen;
     private long _targetTicksSeen;
-    private long _lastMissingFeedLogMs;
-    private long _lastTargetTickTs;
-    private double _targetTickIntervalEwmaMs;
-    private bool _hasTargetTickCadence;
     private double _slippageAbsEwma;
     private double _latencyMsEwma;
     private int _execQualitySamples;
@@ -193,19 +182,11 @@ public sealed class ArbitrageEngine
         _offsetIndex = 0;
         _unstableTickCount = 0;
         ResetEntryPersistence();
-        _rejectStaleCount = 0;
-        _rejectSkewCount = 0;
         _rejectSpreadCount = 0;
-        _rejectCooldownCount = 0;
-        _rejectPersistenceCount = 0;
         _rejectThresholdCount = 0;
         _sourceTicksSeen = 0;
         _targetTicksSeen = 0;
         _lastFlatTimeMs = (long)(Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency);
-        _lastMissingFeedLogMs = 0;
-        _lastTargetTickTs = 0;
-        _targetTickIntervalEwmaMs = 0.0;
-        _hasTargetTickCadence = false;
         _slippageAbsEwma = 0.0;
         _latencyMsEwma = 0.0;
         _execQualitySamples = 0;
@@ -235,7 +216,7 @@ public sealed class ArbitrageEngine
     public void KillSwitch()
     {
         _tradingEnabled = false;
-        _pipes.PublishCommand("KILL|ALL");
+        _pipes.PublishCommand(_cmdKillAll);
     }
 
     public void UpdateConfig(EngineConfig config)
@@ -260,10 +241,6 @@ public sealed class ArbitrageEngine
             _hasTgt = false;
             _unstableTickCount = 0;
             ResetEntryPersistence();
-            _lastMissingFeedLogMs = 0;
-            _lastTargetTickTs = 0;
-            _targetTickIntervalEwmaMs = 0.0;
-            _hasTargetTickCadence = false;
             IsEngineCalibrating = false;
         }
     }
@@ -628,8 +605,8 @@ public sealed class ArbitrageEngine
 
         lock (_configLock)
         {
-            targetTerminal = _targetTerminal.Trim();
-            slaveSymbol = _slaveSymbol.Trim();
+            targetTerminal = _targetTerminal;
+            slaveSymbol = _slaveSymbol;
             lotSize = _lotSize;
             maxSpread = _maxSpread;
             triggerThreshold = _triggerThreshold;
@@ -660,11 +637,6 @@ public sealed class ArbitrageEngine
             _srcAsk = tick.Ask;
             _srcTs = tick.Timestamp;
             _hasSrc = true;
-            if (tick.Timestamp - _lastRithmicLogTimeMs >= 5000)
-            {
-                _lastRithmicLogTimeMs = tick.Timestamp;
-                Log?.Invoke($"[RITHMIC LIVE] {_masterSymbol}: Bid={_srcBid} | Ask={_srcAsk}");
-            }
             if (_isAnalyzing)
             {
                 Interlocked.Increment(ref _analysisSourceTicks);
@@ -673,24 +645,6 @@ public sealed class ArbitrageEngine
         else
         {
             _targetTicksSeen++;
-            if (_lastTargetTickTs > 0)
-            {
-                var deltaMs = tick.Timestamp - _lastTargetTickTs;
-                if (deltaMs > 0 && deltaMs <= 5000)
-                {
-                    if (!_hasTargetTickCadence)
-                    {
-                        _targetTickIntervalEwmaMs = deltaMs;
-                        _hasTargetTickCadence = true;
-                    }
-                    else
-                    {
-                        _targetTickIntervalEwmaMs = (_targetTickIntervalEwmaMs * 0.85) + (deltaMs * 0.15);
-                    }
-                }
-            }
-
-            _lastTargetTickTs = tick.Timestamp;
             _tgtBid = tick.Bid;
             _tgtAsk = tick.Ask;
             _tgtTs = tick.Timestamp;
@@ -706,31 +660,6 @@ public sealed class ArbitrageEngine
         if (!_hasSrc || !_hasTgt)
         {
             IsEngineCalibrating = false;
-
-            var nowMsMissing = (long)(Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency);
-            if (nowMsMissing - _lastMissingFeedLogMs >= 5000)
-            {
-                _lastMissingFeedLogMs = nowMsMissing;
-                if (!_hasSrc && !_hasTgt)
-                {
-                    Log?.Invoke(
-                        $"[ENGINE] Waiting for both feeds. Source={_sourceTerminal}/{_masterSymbol} Target={targetTerminal}/{slaveSymbol}.");
-                }
-                else if (!_hasSrc)
-                {
-                    Log?.Invoke(
-                        $"[ENGINE] Waiting for source feed ticks: {_sourceTerminal}/{_masterSymbol}. " +
-                        $"Seen ticks src={_sourceTicksSeen} tgt={_targetTicksSeen}.");
-                }
-                else
-                {
-                    Log?.Invoke(
-                        $"[ENGINE] Waiting for target feed ticks: {targetTerminal}/{slaveSymbol}. " +
-                        $"Seen ticks src={_sourceTicksSeen} tgt={_targetTicksSeen}. " +
-                        "Check MT5 chart symbol and Slave symbol mapping.");
-                }
-            }
-
             return;
         }
 
@@ -743,13 +672,6 @@ public sealed class ArbitrageEngine
         {
             targetSpread = 0;
         }
-
-        var baselineDenomPreview = _offsetCount > 0 ? (_offsetCount < _calibrationWindow ? _offsetCount : _calibrationWindow) : 1;
-        var averageOffsetPreview = _offsetCount > 0 ? (_offsetSum / baselineDenomPreview) : instantaneousOffset;
-        var mappedSourceBidPreview = _srcBid + averageOffsetPreview;
-        var mappedSourceAskPreview = _srcAsk + averageOffsetPreview;
-        var edgeBuyPreview = mappedSourceBidPreview - _tgtAsk;
-        var edgeSellPreview = _tgtBid - mappedSourceAskPreview;
 
         if (_offsetCount < _calibrationWindow)
         {
@@ -800,7 +722,6 @@ public sealed class ArbitrageEngine
                 _unstableTickCount = 0;
                 averageOffset = instantaneousOffset;
                 deviation = 0.0;
-                Log?.Invoke($"[ENGINE] Baseline force-reset after {_unstableTickLimit} unstable ticks. New offset={instantaneousOffset:F5}");
             }
         }
 
@@ -824,8 +745,11 @@ public sealed class ArbitrageEngine
                 {
                     var killTerminal = _activeTargetTerminal.Length > 0 ? _activeTargetTerminal : targetTerminal;
                     var killSymbol = _activeSlaveSymbol.Length > 0 ? _activeSlaveSymbol : slaveSymbol;
-                    _pipes.PublishCommand($"KILL|{killTerminal}|{killSymbol}");
-                    Log?.Invoke($"[ENGINE] Entry ack timeout ({entryPendingMs}ms). Sent KILL and applied failsafe state reset.");
+                    _pipes.PublishCommand(BuildKillCommand(killTerminal, killSymbol));
+                    Log?.Invoke(string.Concat(
+                        "[ENGINE] Entry ack timeout (",
+                        entryPendingMs.ToString(CultureInfo.InvariantCulture),
+                        "ms). Sent KILL and applied failsafe state reset."));
                     _lastFlatTimeMs = nowMs;
                     ResetOpenPositionState();
                     return;
@@ -850,12 +774,6 @@ public sealed class ArbitrageEngine
         var effectiveTrigger = triggerThreshold;
         var buyCandidate = edgeBuy >= effectiveTrigger;
         var sellCandidate = edgeSell >= effectiveTrigger;
-
-        if (buyCandidate || sellCandidate)
-        {
-            var currentLatencyMs = _execQualitySamples > 0 ? _latencyMsEwma : 0.0;
-            LogTradeConsiderationStats(currentLatencyMs, deviation);
-        }
 
         if (!buyCandidate && !sellCandidate)
         {
@@ -884,9 +802,14 @@ public sealed class ArbitrageEngine
             _openTicket = 0;
             _activeTargetTerminal = targetTerminal;
             _activeSlaveSymbol = slaveSymbol;
-            Log?.Invoke(
-                $"[TRADE] BUY edge={edgeBuy:F5} dev={deviation:F5} spread={targetSpread:F5} offset={averageOffset:F5} trig={effectiveTrigger:F5} " +
-                $"TP={targetTp:F5} SL={targetSl:F5}");
+            Log?.Invoke(string.Concat(
+                "[TRADE] BUY edge=", edgeBuy.ToString("F5", CultureInfo.InvariantCulture),
+                " dev=", deviation.ToString("F5", CultureInfo.InvariantCulture),
+                " spread=", targetSpread.ToString("F5", CultureInfo.InvariantCulture),
+                " offset=", averageOffset.ToString("F5", CultureInfo.InvariantCulture),
+                " trig=", effectiveTrigger.ToString("F5", CultureInfo.InvariantCulture),
+                " TP=", targetTp.ToString("F5", CultureInfo.InvariantCulture),
+                " SL=", targetSl.ToString("F5", CultureInfo.InvariantCulture)));
             _pipes.PublishCommand(BuildTradeCommand("BUY", slaveSymbol, lotSize, targetSl, targetTp, targetTerminal, orderSentUtcMs));
             return;
         }
@@ -910,9 +833,14 @@ public sealed class ArbitrageEngine
         _openTicket = 0;
         _activeTargetTerminal = targetTerminal;
         _activeSlaveSymbol = slaveSymbol;
-        Log?.Invoke(
-            $"[TRADE] SELL edge={edgeSell:F5} dev={deviation:F5} spread={targetSpread:F5} offset={averageOffset:F5} trig={effectiveTrigger:F5} " +
-            $"TP={sellTp:F5} SL={sellSl:F5}");
+        Log?.Invoke(string.Concat(
+            "[TRADE] SELL edge=", edgeSell.ToString("F5", CultureInfo.InvariantCulture),
+            " dev=", deviation.ToString("F5", CultureInfo.InvariantCulture),
+            " spread=", targetSpread.ToString("F5", CultureInfo.InvariantCulture),
+            " offset=", averageOffset.ToString("F5", CultureInfo.InvariantCulture),
+            " trig=", effectiveTrigger.ToString("F5", CultureInfo.InvariantCulture),
+            " TP=", sellTp.ToString("F5", CultureInfo.InvariantCulture),
+            " SL=", sellSl.ToString("F5", CultureInfo.InvariantCulture)));
         _pipes.PublishCommand(BuildTradeCommand("SELL", slaveSymbol, lotSize, sellSl, sellTp, targetTerminal, sellOrderSentUtcMs));
     }
 
@@ -968,7 +896,7 @@ public sealed class ArbitrageEngine
                 {
                     var expectedTerminal = _activeTargetTerminal;
                     var expectedSymbol = _activeSlaveSymbol;
-                    var fillTerminal = (fill.TerminalId ?? string.Empty).Trim();
+                    var fillTerminal = fill.TerminalId ?? string.Empty;
                     var isExpectedTerminal = expectedTerminal.Length == 0
                                              || string.Equals(fillTerminal, expectedTerminal, StringComparison.OrdinalIgnoreCase);
                     var isExpectedSymbol = expectedSymbol.Length == 0 || SymbolMatches(fill.Symbol, expectedSymbol);
@@ -1012,20 +940,39 @@ public sealed class ArbitrageEngine
                                 _targetSlPrice = _entryStopDistance > 0.0 ? (fill.Price + _entryStopDistance) : 0.0;
                             }
 
-                            Log?.Invoke($"[EXECUTION] {fill.Side} | ReqPrice: {_requestPrice:F5} | FillPrice: {fill.Price:F5} | Slippage: {slippage:F5} | Latency: {executionLatency}ms");
-                            Log?.Invoke($"[ENGINE] Re-anchored targets to fill. TP={_targetTpPrice:F5} SL={_targetSlPrice:F5}");
+                            Log?.Invoke(string.Concat(
+                                "[EXECUTION] ",
+                                fill.Side ?? string.Empty,
+                                " | ReqPrice: ", _requestPrice.ToString("F5", CultureInfo.InvariantCulture),
+                                " | FillPrice: ", fill.Price.ToString("F5", CultureInfo.InvariantCulture),
+                                " | Slippage: ", slippage.ToString("F5", CultureInfo.InvariantCulture),
+                                " | Latency: ", executionLatency.ToString(CultureInfo.InvariantCulture), "ms"));
+                            Log?.Invoke(string.Concat(
+                                "[ENGINE] Re-anchored targets to fill. TP=",
+                                _targetTpPrice.ToString("F5", CultureInfo.InvariantCulture),
+                                " SL=",
+                                _targetSlPrice.ToString("F5", CultureInfo.InvariantCulture)));
                         }
                         else
                         {
-                            Log?.Invoke($"[EXECUTION] {fill.Side} | ReqPrice: {_requestPrice:F5} | FillPrice: N/A | Latency: {executionLatency}ms");
+                            Log?.Invoke(string.Concat(
+                                "[EXECUTION] ",
+                                fill.Side ?? string.Empty,
+                                " | ReqPrice: ", _requestPrice.ToString("F5", CultureInfo.InvariantCulture),
+                                " | FillPrice: N/A | Latency: ", executionLatency.ToString(CultureInfo.InvariantCulture), "ms"));
                         }
 
                         if (executionLatency > _maxExecutionLatencyMs)
                         {
                             var killTerminal = expectedTerminal.Length > 0 ? expectedTerminal : fillTerminal;
                             var killSymbol = expectedSymbol.Length > 0 ? expectedSymbol : fill.Symbol;
-                            _pipes.PublishCommand($"KILL|{killTerminal}|{killSymbol}");
-                            Log?.Invoke($"[ENGINE] Toxic fill latency {executionLatency}ms exceeded {_maxExecutionLatencyMs}ms. Sent immediate KILL.");
+                            _pipes.PublishCommand(BuildKillCommand(killTerminal, killSymbol));
+                            Log?.Invoke(string.Concat(
+                                "[TOXIC FILL] Round-trip execution latency of ",
+                                executionLatency.ToString(CultureInfo.InvariantCulture),
+                                "ms exceeded the limit of ",
+                                _maxExecutionLatencyMs.ToString(CultureInfo.InvariantCulture),
+                                "ms. Sent immediate KILL."));
                         }
                         else
                         {
@@ -1045,8 +992,13 @@ public sealed class ArbitrageEngine
                             {
                                 var killTerminal = expectedTerminal.Length > 0 ? expectedTerminal : fillTerminal;
                                 var killSymbol = expectedSymbol.Length > 0 ? expectedSymbol : fill.Symbol;
-                                _pipes.PublishCommand($"KILL|{killTerminal}|{killSymbol}");
-                                Log?.Invoke($"[ENGINE] Fill already crossed target bounds (TPReached={tpReached}, SLExceeded={slExceeded}). Sent immediate KILL.");
+                                _pipes.PublishCommand(BuildKillCommand(killTerminal, killSymbol));
+                                Log?.Invoke(string.Concat(
+                                    "[ENGINE] Fill already crossed target bounds (TPReached=",
+                                    tpReached ? "true" : "false",
+                                    ", SLExceeded=",
+                                    slExceeded ? "true" : "false",
+                                    "). Sent immediate KILL."));
                             }
                             else
                             {
@@ -1054,7 +1006,13 @@ public sealed class ArbitrageEngine
                                 var modifySymbol = expectedSymbol.Length > 0 ? expectedSymbol : fill.Symbol;
                                 var modifyTicket = fill.Ticket > 0 ? fill.Ticket : _openTicket;
                                 _pipes.PublishCommand(BuildModifyCommand(modifyTerminal, modifySymbol, modifyTicket, _targetSlPrice, _targetTpPrice));
-                                Log?.Invoke($"[ENGINE] Sent MODIFY for absolute targets. TP={_targetTpPrice:F5}, SL={_targetSlPrice:F5}, Ticket={modifyTicket}");
+                                Log?.Invoke(string.Concat(
+                                    "[ENGINE] Sent MODIFY for absolute targets. TP=",
+                                    _targetTpPrice.ToString("F5", CultureInfo.InvariantCulture),
+                                    ", SL=",
+                                    _targetSlPrice.ToString("F5", CultureInfo.InvariantCulture),
+                                    ", Ticket=",
+                                    modifyTicket.ToString(CultureInfo.InvariantCulture)));
                             }
                         }
 
@@ -1084,10 +1042,15 @@ public sealed class ArbitrageEngine
         ResetOpenPositionState();
     }
 
+    private static string BuildKillCommand(string terminal, string symbol)
+    {
+        return string.Concat(_cmdKillPrefix, terminal, "|", symbol);
+    }
+
     private static string BuildTradeCommand(string side, string symbol, double lot, double sl, double tp, string terminal, long timestampMs)
     {
         return string.Concat(
-            "TRADE|", terminal,
+            _cmdTradePrefix, terminal,
             "|", symbol,
             "|", side,
             "|", lot.ToString("F2", CultureInfo.InvariantCulture),
@@ -1099,7 +1062,7 @@ public sealed class ArbitrageEngine
     private static string BuildModifyCommand(string terminal, string symbol, long ticket, double sl, double tp)
     {
         return string.Concat(
-            "MODIFY|", terminal,
+            _cmdModifyPrefix, terminal,
             "|", symbol,
             "|", ticket.ToString(CultureInfo.InvariantCulture),
             "|", sl.ToString("0.#####", CultureInfo.InvariantCulture),
@@ -1109,17 +1072,6 @@ public sealed class ArbitrageEngine
     private void ResetEntryPersistence()
     {
         // Persistence filter removed: entry is now driven only by trigger threshold and max spread.
-    }
-
-    private void LogTradeConsiderationStats(double latencyMs, double gap)
-    {
-        var totalRejects = _rejectStaleCount
-                           + _rejectSkewCount
-                           + _rejectSpreadCount
-                           + _rejectCooldownCount
-                           + _rejectPersistenceCount
-                           + _rejectThresholdCount;
-        Log?.Invoke($"[STATS] Latency: {latencyMs:F1} ms | Gap: {gap:F5} | Rejects: {totalRejects}");
     }
 
     private void ResetOpenPositionState()
